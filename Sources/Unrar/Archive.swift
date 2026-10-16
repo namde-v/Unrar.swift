@@ -4,6 +4,51 @@
 import Cunrar
 import Foundation
 
+// unrar's LPARAM is `#define`d as `long`: 64 bits on macOS/Linux, but 32 bits
+// on Windows (LLP64). Name the platform's LPARAM width once for the
+// conversions below.
+#if os(Windows)
+typealias UnrarLPARAM = Int32
+#else
+typealias UnrarLPARAM = Int
+#endif
+
+/// Routes UNRARCALLBACK's `UserData` through a small-integer table instead of a
+/// raw object pointer: on Windows the 32-bit LPARAM cannot hold a 64-bit
+/// pointer, so passing the `Callback` object directly would truncate it and
+/// crash when the callback fires. The table keeps the object alive for the
+/// duration of the extraction and behaves identically on every platform.
+private final class CallbackRegistry: @unchecked Sendable {
+    static let shared = CallbackRegistry()
+
+    private let lock = NSLock()
+    private var nextID: Int32 = 1
+    private var table: [Int32: Archive.Callback] = [:]
+
+    private init() {}
+
+    func register(_ callback: Archive.Callback) -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        let id = nextID
+        nextID = nextID == .max ? 1 : nextID + 1
+        table[id] = callback
+        return id
+    }
+
+    func callback(for id: Int32) -> Archive.Callback? {
+        lock.lock()
+        defer { lock.unlock() }
+        return table[id]
+    }
+
+    func unregister(_ id: Int32) {
+        lock.lock()
+        defer { lock.unlock() }
+        table.removeValue(forKey: id)
+    }
+}
+
 // NOTE: This class is not thread safe.
 public struct Archive: Sendable {
     public let fileURL: URL
@@ -119,23 +164,35 @@ public struct Archive: Sendable {
             handler(Data(), progress)
             return
         }
-        let handlerPointer = Unmanaged<Callback>.passRetained(Callback(entry.uncompressedSize, handler)).toOpaque()
+        // See CallbackRegistry: the C callback cannot carry the object pointer on
+        // Windows (32-bit LPARAM), so it carries a registry ID instead.
+        let stateID = CallbackRegistry.shared.register(Callback(entry.uncompressedSize, handler))
+        defer { CallbackRegistry.shared.unregister(stateID) }
         let callback: UNRARCALLBACK = { msg, userData, p1, p2 in
+            // `userData` is the registry ID. Int32(userData) compiles on every
+            // platform: LPARAM is Int32 on Windows, Int on macOS/Linux.
+            guard let state = CallbackRegistry.shared.callback(for: Int32(userData)) else {
+                return 0
+            }
             switch msg {
-            case UCM_PROCESSDATA.rawValue:
-                guard let mySelfPtr = UnsafeRawPointer(bitPattern: userData) else {
-                    return 0
-                }
-                let handler = Unmanaged<Callback>.fromOpaque(mySelfPtr).takeUnretainedValue()
+            // UNRARCALLBACK_MESSAGES imports with a platform ABI-dependent raw
+            // type (unsigned on macOS/Linux, signed on Windows): convert to
+            // UInt32 to compare against `msg` (UINT) on every platform.
+            case UInt32(UCM_PROCESSDATA.rawValue):
+                // p1/p2 are LPARAM (32-bit on Windows, 64-bit elsewhere):
+                // widen to Int once for the pointer/count conversions below.
+                let p1 = Int(p1)
+                let p2 = Int(p2)
                 if let ptr = UnsafeRawPointer(bitPattern: p1) {
                     let data = Data(bytes: ptr, count: p2)
-                    handler.progress.completedUnitCount += Int64(p2)
-                    handler.callback(data, handler.progress)
-                    if handler.progress.isCancelled {
+                    state.progress.completedUnitCount += Int64(p2)
+                    state.callback(data, state.progress)
+                    if state.progress.isCancelled {
                         return -1
                     }
                 }
-            case UCM_NEEDPASSWORD.rawValue, UCM_NEEDPASSWORDW.rawValue:
+            case UInt32(UCM_NEEDPASSWORD.rawValue),
+                 UInt32(UCM_NEEDPASSWORDW.rawValue):
                 // TODO ?
                 break
             default:
@@ -153,7 +210,6 @@ public struct Archive: Sendable {
             throw UnrarError.badArchive
         }
         defer {
-            Unmanaged<Callback>.fromOpaque(handlerPointer).release()
             RARCloseArchive(data)
         }
         loop: repeat {
@@ -162,7 +218,7 @@ public struct Archive: Sendable {
             case ERAR_SUCCESS:
                 // compare fileName
                 if Entry(header) == entry {
-                    RARSetCallback(data, callback, Int(bitPattern: OpaquePointer(handlerPointer)))
+                    RARSetCallback(data, callback, UnrarLPARAM(stateID))
                     let result = RARProcessFile(data, RAR_OM_EXTRACT, nil, nil)
                     RARSetCallback(data, nil, 0)
                     if result != ERAR_SUCCESS {
