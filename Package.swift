@@ -48,6 +48,14 @@ let package = Package(
                 .define("RARDLL"),
                 .define("_FILE_OFFSET_BITS", to: "64"),
                 .define("_LARGEFILE_SOURCE"),
+                // MSVC 14.51+ (VS 2026) requires Clang 20+, but Swift 6.2 bundles
+                // Clang 19. This suppresses the STL1000 version check.
+                // (downstream fork addition)
+                .define("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", .when(platforms: [.windows])),
+            ],
+            cxxSettings: [
+                // Same as above, for the C++ (.cpp) sources.
+                .define("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", .when(platforms: [.windows])),
             ]
         ),
         .testTarget(
