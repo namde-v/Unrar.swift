@@ -78,7 +78,10 @@
 #include <intrin.h>
 
 // Use SSE only for x86/x64, not ARM Windows.
-#if defined(_M_IX86) || defined(_M_X64)
+// Disabled for Clang on Windows (SwiftPM): Clang does not enable SSSE3 by
+// default, and SwiftPM cannot pass -mssse3 to dependencies (no unsafeFlags).
+// The portable C++ fallback is used instead.
+#if (defined(_M_IX86) || defined(_M_X64)) && !defined(__clang__)
   #define USE_SSE
   #define SSE_ALIGNMENT 16
 #endif
